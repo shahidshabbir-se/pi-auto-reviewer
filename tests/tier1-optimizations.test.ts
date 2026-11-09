@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import extension, {
+    analyzeCommand,
     defeatsAutoPermit,
     isSafePipeline,
     matchesAutoPermitted,
@@ -46,6 +47,58 @@ test("matchesAutoPermitted identifies safe read-only commands with safe redirect
     assert.equal(matchesAutoPermitted("python3 --version 2>&1"), true);
     assert.equal(matchesAutoPermitted("diff a.txt b.txt"), true);
     assert.equal(matchesAutoPermitted("jq .name package.json"), true);
+});
+
+test("matchesAutoPermitted identifies safe Herdr inspection and workflow commands", () => {
+    // Read operations
+    assert.equal(matchesAutoPermitted("herdr pane read w3V:p1 --source visible"), true);
+    assert.equal(matchesAutoPermitted("herdr pane read w3V:p1 --lines 10"), true);
+    assert.equal(matchesAutoPermitted("herdr pane list --workspace w3V"), true);
+    assert.equal(matchesAutoPermitted("herdr agent list"), true);
+    assert.equal(matchesAutoPermitted("herdr agent get worker1"), true);
+    assert.equal(matchesAutoPermitted("herdr agent read worker1 --lines 50"), true);
+    assert.equal(matchesAutoPermitted("herdr worktree list --cwd \"$PWD\""), true);
+    assert.equal(matchesAutoPermitted("herdr status"), true);
+    assert.equal(matchesAutoPermitted("herdr --version"), true);
+
+    // Constructive agent and workspace coordination
+    assert.equal(matchesAutoPermitted("herdr agent start worker1 --kind pi --pane w3V:p1"), true);
+    assert.equal(matchesAutoPermitted("herdr worktree create --cwd \"$PWD\" --branch ticket-1-auth --no-focus"), true);
+    assert.equal(matchesAutoPermitted("herdr pane split --current --direction right --no-focus"), true);
+    assert.equal(matchesAutoPermitted("herdr pane focus w3V:p1"), true);
+    assert.equal(matchesAutoPermitted("herdr tab create"), true);
+    assert.equal(matchesAutoPermitted("herdr workspace create dev"), true);
+    assert.equal(matchesAutoPermitted("herdr agent prompt worker1 \"Review the current diff\" --wait"), true);
+    assert.equal(matchesAutoPermitted("herdr agent send-keys worker1 esc"), true);
+    assert.equal(matchesAutoPermitted("herdr pane wait-output w3V:p1 --match \"ready\""), true);
+
+    // Global options supported
+    assert.equal(matchesAutoPermitted("herdr --session dev pane read w3V:p1"), true);
+    assert.equal(matchesAutoPermitted("herdr -s dev pane list"), true);
+    assert.equal(matchesAutoPermitted("herdr --machine box1 agent list"), true);
+});
+
+test("matchesAutoPermitted excludes destructive or arbitrary Herdr commands", () => {
+    assert.equal(matchesAutoPermitted("herdr worktree remove ticket-1-auth"), false);
+    assert.equal(matchesAutoPermitted("herdr pane close w3V:p1"), false);
+    assert.equal(matchesAutoPermitted("herdr tab close w3V:t1"), false);
+    assert.equal(matchesAutoPermitted("herdr workspace close w3V"), false);
+    assert.equal(matchesAutoPermitted("herdr server stop"), false);
+    assert.equal(matchesAutoPermitted("herdr pane run w3V:p1 \"echo hello\""), false);
+    assert.equal(matchesAutoPermitted("herdr pane send-text w3V:p1 \"hello\""), false);
+});
+
+test("analyzeCommand flags dangerous Herdr behaviors", () => {
+    assert.deepEqual(analyzeCommand("herdr worktree remove ticket-1-auth").behaviors, ["worktree-remove"]);
+    assert.deepEqual(analyzeCommand("herdr --session dev worktree remove ticket-1-auth").behaviors, ["worktree-remove"]);
+    assert.deepEqual(analyzeCommand("herdr pane close w3V:p1").behaviors, ["herdr-close"]);
+    assert.deepEqual(analyzeCommand("herdr tab close w3V:t1").behaviors, ["herdr-close"]);
+    assert.deepEqual(analyzeCommand("herdr workspace close w3V").behaviors, ["herdr-close"]);
+    assert.deepEqual(analyzeCommand("herdr server stop").behaviors, ["herdr-server-stop"]);
+
+    // Safe Herdr commands have no behaviors flagged
+    assert.deepEqual(analyzeCommand("herdr pane read w3V:p1 --source visible").behaviors, []);
+    assert.deepEqual(analyzeCommand("herdr agent start worker1 --kind pi --pane w3V:p1").behaviors, []);
 });
 
 test("isSafePipeline validates pipelines of read-only commands", () => {

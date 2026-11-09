@@ -646,6 +646,9 @@ function formatContextSection(ctx: ReviewContext): string {
 // command falls through to tier-3 LLM review regardless of the leading verb.
 // (Codex avoids this class of bug entirely by having the reviewer itself bless
 // prefix rules from evidence; a static list can't, so we stay conservative.)
+const HERDR_OPT = `(?:--(?:session|machine|remote|remote-keybindings|cwd)|-[sm])(?:\\s+|=)(?:"[^"]*"|'[^']*'|\\S+)|--handoff`;
+const HERDR_OPTS = `(?:\\s+(?:${HERDR_OPT}))*`;
+
 const AUTO_PERMITTED = [
     // Read-only directory listing
     /^(ls|dir|tree)\b/,
@@ -667,6 +670,17 @@ const AUTO_PERMITTED = [
     /^(npm|yarn|pnpm)\s+(list|info|view|outdated|audit|why|config\s+list)\b/,
     /^(pip|pip3)\s+(list|show|freeze|search)\b/,
     /^(cargo|go)\s+(search|doc)\b/,
+    // Herdr terminal workspace and agent management
+    new RegExp(`^herdr${HERDR_OPTS}\\s+(status|version|--version|-V|--help|-h|--skill|--default-config|api)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+pane\\s+(list|current|get|layout|process-info|neighbor|edges|read|wait-output|split|focus|resize|zoom|rename|input|swap|move|report-agent|report-agent-session|release-agent|report-metadata)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+agent\\s+(list|get|focus|read|send-keys|rename|wait|start|prompt|explain)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+workspace\\s+(list|current|get|layout|focus|rename|create|open)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+worktree\\s+(list|create|open)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+tab\\s+(list|current|get|create|rename|focus|move)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+notification\\s+(list|get|send|dismiss)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+machine\\s+(list|status)\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+session\\s+list\\b`),
+    new RegExp(`^herdr${HERDR_OPTS}\\s+integration\\s+(list|get)\\b`),
     // System info
     /^(echo|printenv|env|whoami|hostname|uname|uptime|id|groups|pwd|date)\b/,
     // Python/node one-off checks (no args = safe)
@@ -791,12 +805,14 @@ type CommandBehavior =
     | "remote-shell"
     | "powershell-recursive-delete"
     | "windows-elevation"
-    | "windows-shutdown";
+    | "windows-shutdown"
+    | "herdr-close"
+    | "herdr-server-stop";
 
 const BEHAVIOR_DESCRIPTIONS: Record<CommandBehavior, string> = {
     "force-push": "Git push with --force, --force-with-lease, --force-if-includes, or a +refspec (overwrites remote history)",
     "branch-delete": "Git branch deletion (-d/-D/--delete); irreversible if the branch has no remote tracking or reflog expires",
-    "worktree-remove": "Git worktree remove; deletes the linked working tree directory",
+    "worktree-remove": "Git/Herdr worktree remove; deletes the linked working tree directory",
     "hard-reset": "Git reset --hard; discards working tree and index changes",
     "git-clean": "Git clean with -f/-x/-d; deletes untracked/ignored files or directories",
     "recursive-delete": "rm -r/-rf removes directories recursively (high risk of data loss)",
@@ -809,6 +825,8 @@ const BEHAVIOR_DESCRIPTIONS: Record<CommandBehavior, string> = {
     "powershell-recursive-delete": "Remove-Item -Recurse / del / rmdir /s deletes directories recursively",
     "windows-elevation": "Start-Process -Verb RunAs or similar UAC elevation",
     "windows-shutdown": "Stop-Computer / Restart-Computer / shutdown.exe / format / diskpart stops or damages the system",
+    "herdr-close": "Herdr close operation; terminates a pane, tab, or workspace",
+    "herdr-server-stop": "Herdr server stop; shuts down the background Herdr server and its running sessions",
 };
 
 interface BehaviorAnalysis {
@@ -945,7 +963,44 @@ function analyzeGit(args: string[]): CommandBehavior[] {
     return behaviors;
 }
 
-function analyzeCommand(command: string): BehaviorAnalysis {
+function skipHerdrGlobalOptions(args: string[]): { subcommand: string; rest: string[] } | null {
+    let i = 0;
+    while (i < args.length && args[i].startsWith("-")) {
+        if (["--session", "-s", "--machine", "-m", "--remote", "--remote-keybindings", "--cwd"].includes(args[i])) {
+            i += 2;
+        } else if (["--handoff", "--default-config", "--skill", "--version", "-V", "--help", "-h"].includes(args[i])) {
+            i += 1;
+        } else {
+            i += 1;
+        }
+        if (i > args.length) return null;
+    }
+    if (i >= args.length) return null;
+    return { subcommand: args[i], rest: args.slice(i + 1) };
+}
+
+export function analyzeHerdr(args: string[]): CommandBehavior[] {
+    const skipped = skipHerdrGlobalOptions(args);
+    if (!skipped) return [];
+    const { subcommand, rest } = skipped;
+    const behaviors: CommandBehavior[] = [];
+    switch (subcommand) {
+        case "worktree":
+            if (rest[0] === "remove") behaviors.push("worktree-remove");
+            break;
+        case "pane":
+        case "tab":
+        case "workspace":
+            if (rest[0] === "close") behaviors.push("herdr-close");
+            break;
+        case "server":
+            if (rest[0] === "stop") behaviors.push("herdr-server-stop");
+            break;
+    }
+    return behaviors;
+}
+
+export function analyzeCommand(command: string): BehaviorAnalysis {
     const tokens = roughTokenize(command);
     const behaviors: CommandBehavior[] = [];
     let hardBlocked = false;
@@ -955,6 +1010,12 @@ function analyzeCommand(command: string): BehaviorAnalysis {
     const gitArgs = extractLeadingArgs(tokens, "git");
     if (gitArgs) {
         behaviors.push(...analyzeGit(gitArgs));
+    }
+
+    // Herdr-specific parsing
+    const herdrArgs = extractLeadingArgs(tokens, "herdr");
+    if (herdrArgs) {
+        behaviors.push(...analyzeHerdr(herdrArgs));
     }
 
     // Hard-block detection (system-catastrophic commands)
@@ -1169,9 +1230,9 @@ DO:
 - When in doubt about whether a command is safe, BLOCK conservatively.
 
 === REVIEW RULES ===
-1. Read-only operations (ls, cat, grep, find, git status, etc.) → ALLOW
-2. Constructive modifications (install deps, build, lint, format, test, write source files, create temp files in /tmp or $env:TEMP) → ALLOW
-3. Destructive operations (rm, force-push, branch-delete, worktree-remove, reset --hard, clean -fd) on user data or outside the project → BLOCK unless clearly scoped to a known temp/dev artifact
+1. Read-only operations (ls, cat, grep, find, git status, herdr pane/agent read/list/status/get/wait, etc.) → ALLOW
+2. Constructive modifications (install deps, build, lint, format, test, write source files, create temp files in /tmp or $env:TEMP, terminal multiplexer / agent coordination such as herdr agent start/prompt, herdr pane split/focus, herdr workspace/worktree create, tmux) → ALLOW
+3. Destructive operations (rm, force-push, branch-delete, worktree-remove, reset --hard, clean -fd, herdr pane/tab/workspace close, herdr server stop) on user data or outside the project → BLOCK unless clearly scoped to a known temp/dev artifact
 4. Commands that expand env vars that look like secrets ($SECRET, $TOKEN, $API_KEY, $AWS_*, $GH_TOKEN, etc.) → BLOCK to prevent leaks
 5. Pipes from remote content to a shell (curl | sh, wget | bash, fetch | sh) → BLOCK
 6. Standard package manager installs (npm install, pip install, cargo add) → ALLOW (dev workflow)
